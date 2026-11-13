@@ -1,0 +1,28 @@
+[Unit]
+Description=MailBridge MCP OAuth authentication gateway
+After=network-online.target mailbridge-mcp.service
+Wants=network-online.target
+Requires=mailbridge-mcp.service
+
+[Service]
+Type=simple
+User=mailbridge-mcp
+Group=mailbridge-mcp
+WorkingDirectory=/opt/mcp/mailbridge/gateway
+Environment=PORT=4204
+EnvironmentFile=/opt/mcp/mailbridge/.env
+Environment=UPSTREAM_URL=http://127.0.0.1:18760
+Environment=UPSTREAM_TOKEN_FILE=/var/lib/mailbridge/mcp-bearer-token
+Environment=OAUTH_PASSWORD_FILE=/var/lib/mailbridge/oauth-approval-password
+Environment=OAUTH_DATABASE=/var/lib/mailbridge/oauth.sqlite
+ExecStart=/usr/local/bin/node /opt/mcp/mailbridge/gateway/src/index.mjs
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/mailbridge
+
+[Install]
+WantedBy=multi-user.target

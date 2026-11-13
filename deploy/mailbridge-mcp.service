@@ -1,0 +1,33 @@
+[Unit]
+Description=MailBridge authenticated Streamable HTTP MCP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/opt/mcp/mailbridge/.env
+Type=simple
+User=mailbridge-mcp
+Group=mailbridge-mcp
+WorkingDirectory=/opt/mcp/mailbridge
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=MAILBRIDGE_LANG=zh
+Environment=MAILBRIDGE_HOME=/var/lib/mailbridge/.mailbridge
+Environment=MAILBRIDGE_TOKEN_FILE=/var/lib/mailbridge/mcp-bearer-token
+Environment=MAILBRIDGE_PORT=18760
+Environment=HOME=/var/lib/mailbridge
+ExecStart=/opt/mcp/mailbridge/.venv/bin/python /opt/mcp/mailbridge/deploy/run_http.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+StateDirectory=mailbridge
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/mailbridge
+
+[Install]
+WantedBy=multi-user.target

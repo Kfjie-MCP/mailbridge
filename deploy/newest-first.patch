@@ -1,0 +1,232 @@
+--- a/server/backend_imap.py
++++ b/server/backend_imap.py
+@@ -8,11 +8,13 @@
+ from __future__ import annotations
+ 
+ import email
++import hashlib
+ import imaplib
+ import os
+ import re
+ import smtplib
+ import ssl
++import sqlite3
+ import sys
+ import time
+ from email.message import EmailMessage
+@@ -21,8 +23,9 @@
+ from typing import Any, Dict, Iterable, List, Optional, Tuple
+ 
+ import imap_utf7
+-from config import Account, ConfigError
++from config import Account, ConfigError, CONFIG_DIR
+ from emailutil import (
++    date_sort_key,
+     decode_header_value,
+     html_to_text,
+     iso_to_datetime,
+@@ -107,6 +110,7 @@
+         self._selected: Optional[str] = None
+         self._selected_readonly = True
+         self._folder_cache: Optional[List[Dict[str, Any]]] = None
++        self._date_cache: Dict[str, Tuple[Any, Dict[int, float]]] = {}
+ 
+     # ------------------------------------------------------------ connection
+ 
+@@ -175,6 +179,7 @@
+                 pass
+         self._conn = None
+         self._selected = None
++        self._date_cache.clear()
+ 
+     def close(self) -> None:
+         self._reset()
+@@ -337,6 +342,8 @@
+         has_attachment: bool = False,
+         limit: int = 25,
+     ) -> List[Dict[str, Any]]:
++        if limit <= 0:
++            return []
+         target = self._resolve_folder(folder)
+         self._select(target, readonly=True)
+ 
+@@ -366,15 +373,103 @@
+         if not uids:
+             return []
+ 
+-        # Highest UID ~= newest. Over-fetch when we still have to filter by
+-        # attachment presence.
++        # UID order is arrival order, not the Date header's chronology. Sort
++        # the complete match set before limiting; imported mail can have newer
++        # UIDs than today's messages. Small sets can be sorted after fetching.
++        if len(uids) > limit:
++            uids = self._newest_uids(target, uids, criteria)
+         window = limit * 4 if has_attachment else limit
+-        selected = uids[-max(window, limit):]
+-        messages = self._fetch_summaries(target, selected)
+-        if has_attachment:
+-            messages = [m for m in messages if m.get("has_attachments")]
+-        messages.sort(key=lambda m: m.get("date") or "", reverse=True)
++        messages: List[Dict[str, Any]] = []
++        for batch in _chunks(uids, window):
++            found = self._fetch_summaries(target, batch)
++            if has_attachment:
++                found = [m for m in found if m.get("has_attachments")]
++            messages.extend(found)
++            if len(messages) >= limit:
++                break
++        messages.sort(
++            key=lambda m: (date_sort_key(m.get("date")), int(m["id"].rsplit("|", 1)[1])),
++            reverse=True,
++        )
+         return messages[:limit]
++
++    def _newest_uids(
++        self, folder: str, uids: List[int], criteria: List[bytes]
++    ) -> List[int]:
++        """Use server sorting or cached, read-only Date/INTERNALDATE metadata."""
++        conn = self.conn()
++        capabilities = {
++            (cap.decode("ascii", "replace") if isinstance(cap, bytes) else cap).upper()
++            for cap in (getattr(conn, "capabilities", ()) or ())
++        }
++        if any(cap == "SORT" or cap.startswith("SORT=") for cap in capabilities):
++            try:
++                status, data = conn.uid("SORT", "(DATE)", "UTF-8", *criteria)
++                if status == "OK":
++                    matched = set(uids)
++                    ordered = list(dict.fromkeys(
++                        int(uid) for uid in _first(data).split()
++                        if uid.isdigit() and int(uid) in matched
++                    ))
++                    if set(ordered) == matched:
++                        return list(reversed(ordered))
++            except imaplib.IMAP4.abort:
++                raise
++            except imaplib.IMAP4.error:
++                pass  # An advertised SORT implementation may reject this query.
++
++        # UIDVALIDITY invalidates cached UIDs after a mailbox is rebuilt. A
++        # reconnect also clears this cache in _reset(). Dates are immutable for
++        # a UID; flags and the matching UID set are still queried on every call.
++        responses = getattr(conn, "untagged_responses", {})
++        validity = (responses.get("UIDVALIDITY") or [id(conn)])[-1]
++        old_validity, dates = self._date_cache.get(folder, (None, {}))
++        if old_validity != validity:
++            dates = self._stored_dates(folder, validity)
++        self._date_cache[folder] = (validity, dates)
++        missing = [uid for uid in uids if uid not in dates]
++        for batch in _chunks(missing, 100):
++            status, data = conn.uid(
++                "FETCH", ",".join(str(uid) for uid in batch),
++                "(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (DATE)])",
++            )
++            if status != "OK":
++                raise ImapError(f"Date FETCH failed: {_first(data)}")
++            updated: Dict[int, float] = {}
++            for message in _parse_fetch_summaries(data, folder, self.account.name):
++                uid = int(message["id"].rsplit("|", 1)[1])
++                updated[uid] = date_sort_key(message.get("date"))
++            dates.update(updated)
++            self._stored_dates(folder, validity, updated)
++        return sorted(uids, key=lambda uid: (dates.get(uid, float("-inf")), uid), reverse=True)
++
++    def _stored_dates(
++        self, folder: str, validity: Any, updates: Optional[Dict[int, float]] = None
++    ) -> Dict[int, float]:
++        """Persist only UID/date metadata, scoped to mailbox identity and UIDVALIDITY."""
++        if not isinstance(validity, (bytes, str)):
++            return {}  # Without UIDVALIDITY, only the live connection is trustworthy.
++        identity = [self.account.imap_host, str(self.account.imap_port),
++                    self.account.imap_user, self.account.name, folder]
++        mailbox = hashlib.sha256("\0".join(identity).encode()).hexdigest()
++        version = validity.decode("ascii", "replace") if isinstance(validity, bytes) else validity
++        path = os.path.join(CONFIG_DIR, "date-index.sqlite3")
++        try:
++            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
++            os.close(fd)
++            os.chmod(path, 0o600)
++            with sqlite3.connect(path, timeout=2) as store:
++                store.execute("CREATE TABLE IF NOT EXISTS dates (mailbox TEXT, validity TEXT, "
++                              "uid INTEGER, timestamp REAL, PRIMARY KEY (mailbox, uid))")
++                if updates is not None:
++                    store.execute("DELETE FROM dates WHERE mailbox = ? AND validity != ?", (mailbox, version))
++                    store.executemany("INSERT OR REPLACE INTO dates VALUES (?, ?, ?, ?)",
++                                      [(mailbox, version, uid, stamp) for uid, stamp in updates.items()])
++                    return {}
++                return dict(store.execute("SELECT uid, timestamp FROM dates "
++                                          "WHERE mailbox = ? AND validity = ?", (mailbox, version)))
++        except (OSError, sqlite3.Error):
++            return {}  # A read-only/unavailable cache must never change search correctness.
+ 
+     def _uid_search(self, criteria: List[bytes]) -> List[int]:
+         conn = self.conn()
+--- a/server/emailutil.py
++++ b/server/emailutil.py
+@@ -68,6 +68,15 @@
+     if dt.tzinfo is None:
+         dt = dt.replace(tzinfo=timezone.utc)
+     return dt.isoformat()
++
++
++def date_sort_key(value: Optional[str]) -> float:
++    """Compare message dates by their actual instant, including timezone offsets."""
++    try:
++        dt = iso_to_datetime(value)
++        return dt.timestamp() if dt is not None else float("-inf")
++    except (ValueError, OverflowError, OSError):
++        return float("-inf")
+ 
+ 
+ def iso_to_datetime(value: Optional[str]) -> Optional[datetime]:
+--- a/server/server.py
++++ b/server/server.py
+@@ -24,7 +24,7 @@
+ from backend_graph import GraphBackend, GraphError  # noqa: E402
+ from backend_imap import ImapBackend, ImapError  # noqa: E402
+ from config import Config, ConfigError  # noqa: E402
+-from emailutil import format_size, truncate  # noqa: E402
++from emailutil import date_sort_key, format_size, truncate  # noqa: E402
+ from mcp_stdio import MCPServer, ToolError  # noqa: E402
+ from oauth_ms import AuthError, token_status  # noqa: E402
+ 
+@@ -53,6 +53,8 @@
+ Working efficiently:
+   * mail_search returns summaries only. Call mail_get_message for full bodies,
+     and only for the messages that matter.
++  * mail_search returns the newest matching messages first, comparing actual
++    message dates across timezones rather than assuming that larger UIDs are newer.
+   * Start with mail_list_accounts if you do not know which accounts exist.
+   * Omit `accounts` on mail_search to search every configured account at once.
+   * For "what needs my attention", use mail_digest rather than many searches.
+@@ -210,7 +212,8 @@
+     "mail_search",
+     "Search mail across one or all accounts and return message summaries (no bodies). "
+     "Combine filters freely: free-text `query`, `sender`, `subject`, date range, "
+-    "unread-only, attachments-only. Results are newest first. Use the returned `id` "
++    "unread-only, attachments-only. All matching messages are ordered by actual date "
++    "newest first before applying the per-account limit. Use the returned `id` "
+     "with mail_get_message to read a message in full.",
+     {
+         "type": "object",
+@@ -292,7 +295,7 @@
+         except BACKEND_ERRORS as exc:
+             errors.append({"account": account.name, "error": str(exc)})
+ 
+-    results.sort(key=lambda m: m.get("date") or "", reverse=True)
++    results.sort(key=lambda m: date_sort_key(m.get("date")), reverse=True)
+     out: Dict[str, Any] = {"count": len(results), "messages": results}
+     if errors:
+         out["errors"] = errors
+--- a/server/i18n.py
++++ b/server/i18n.py
+@@ -111,7 +111,8 @@
+ 失效，请重新搜索获取最新 id。
+ 
+ 高效使用：
+-  * mail_search 只返回摘要。需要读正文时再调 mail_get_message，且只读真正相关的。
++  * mail_search 只返回摘要，先按邮件日期从新到旧排序，再截取每个账号的结果数；
++    不把 UID 大小当成日期顺序。需要读正文时再调 mail_get_message，且只读真正相关的。
+   * 不清楚有哪些账号时，先调 mail_list_accounts。
+   * mail_search 省略 `accounts` 参数即可同时搜索所有已配置账号。
+   * "有什么需要我处理的" 这类需求用 mail_digest 一次拿到全量摘要，不要发起多次搜索。
