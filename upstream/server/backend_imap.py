@@ -74,6 +74,16 @@ class ImapError(Exception):
     pass
 
 
+class IndexPendingError(ImapError):
+    """A resumable date index is incomplete; never return a partial latest set."""
+
+    code = "MAIL_INDEX_PENDING"
+
+    def __init__(self, completed: int, total: int) -> None:
+        self.completed, self.total = completed, total
+        super().__init__(f"邮件日期索引准备中（{completed}/{total}），进度已保存，请重试。")
+
+
 def _q(value: str) -> bytes:
     """Quote a string for an IMAP command, UTF-8 encoded."""
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
@@ -428,7 +438,12 @@ class ImapBackend:
             dates = self._stored_dates(folder, validity)
         self._date_cache[folder] = (validity, dates)
         missing = [uid for uid in uids if uid not in dates]
+        # Stay inside remote clients' request deadlines. Every completed batch
+        # is persisted so retries continue rather than restarting the scan.
+        deadline = getattr(self, "index_deadline", None) or time.monotonic() + 20
         for batch in _chunks(missing, 100):
+            if time.monotonic() >= deadline:
+                raise IndexPendingError(sum(uid in dates for uid in uids), len(uids))
             status, data = conn.uid(
                 "FETCH", ",".join(str(uid) for uid in batch),
                 "(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (DATE)])",

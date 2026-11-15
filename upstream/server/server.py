@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import i18n  # noqa: E402
 from backend_graph import GraphBackend, GraphError  # noqa: E402
-from backend_imap import ImapBackend, ImapError  # noqa: E402
+from backend_imap import ImapBackend, ImapError, IndexPendingError  # noqa: E402
 from config import Config, ConfigError  # noqa: E402
 from emailutil import date_sort_key, format_size, truncate  # noqa: E402
 from mcp_stdio import MCPServer, ToolError  # noqa: E402
@@ -292,6 +292,9 @@ def mail_search(
                 limit=limit,
             )
             results.extend(found)
+        except IndexPendingError as exc:
+            # A partial account set cannot establish the newest cross-account mail.
+            raise ToolError(str(exc)) from exc
         except BACKEND_ERRORS as exc:
             errors.append({"account": account.name, "error": str(exc)})
 

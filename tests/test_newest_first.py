@@ -9,7 +9,7 @@ import tempfile
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "upstream" / "server"))
-from backend_imap import ImapBackend, ImapError
+from backend_imap import ImapBackend, ImapError, IndexPendingError
 from emailutil import date_sort_key
 import server as mailserver
 
@@ -157,6 +157,38 @@ class NewestFirst(unittest.TestCase):
         self.assertEqual(instance.search(limit=1)[0]["id"], "INBOX|1001")
         batches = [args[0] for command, args in connection.commands if command == "FETCH" and "BODYSTRUCTURE" not in args[1]]
         self.assertEqual([len(batch.split(",")) for batch in batches], [100] * 10 + [1])
+
+    def test_slow_index_saves_progress_and_resumes_without_a_partial_result(self):
+        messages = {uid: {"date": "14 Nov 2026 12:00:00 +0000"} for uid in range(1, 302)}
+        instance, connection = backend(messages)
+        clock = [0]
+        original = connection.uid
+        def slow_fetch(command, *args):
+            result = original(command, *args)
+            if command == "FETCH":
+                clock[0] += 11
+            return result
+        connection.uid = slow_fetch
+        with patch('backend_imap.time.monotonic', side_effect=lambda: clock[0]):
+            with self.assertRaises(IndexPendingError) as caught:
+                instance.search(limit=1)
+        self.assertEqual((caught.exception.completed, caught.exception.total), (200, 301))
+        instance._reset()
+        connection.commands.clear()
+        self.assertEqual(instance.search(limit=1)[0]['id'], 'INBOX|301')
+        batches = [args[0] for command, args in connection.commands if command == 'FETCH' and 'BODYSTRUCTURE' not in args[1]]
+        self.assertEqual([len(batch.split(',')) for batch in batches], [100, 1])
+
+    def test_pending_account_never_returns_a_misleading_partial_latest_set(self):
+        accounts = [SimpleNamespace(name='ready'), SimpleNamespace(name='indexing')]
+        def search(name):
+            if name == 'indexing':
+                raise IndexPendingError(100, 1000)
+            return [{'date': '2024-08-01T00:00:00+00:00', 'id': 'old'}]
+        with patch.object(mailserver, 'all_accounts', return_value=accounts), patch.object(mailserver, 'backend_for', side_effect=lambda name: SimpleNamespace(search=lambda **kw: search(name))):
+            with self.assertRaises(mailserver.ToolError) as caught:
+                mailserver.mail_search()
+        self.assertIsInstance(caught.exception.__cause__, IndexPendingError)
 
     def test_cross_account_merge_compares_timezones(self):
         accounts = [SimpleNamespace(name="first"), SimpleNamespace(name="second")]
